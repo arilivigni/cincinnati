@@ -4,9 +4,12 @@ use self::cincinnati::plugins::internal::graph_builder::github_openshift_seconda
 use self::cincinnati::plugins::prelude::*;
 use self::cincinnati::plugins::prelude_plugin_impl::*;
 
-pub static DEFAULT_KEY_FILTER: &str = "io.openshift.upgrades.graph";
+use std::collections::HashSet;
 
-mod graph_data_model {
+pub static DEFAULT_KEY_FILTER: &str = "io.openshift.upgrades.graph";
+static SUPPORTED_VERSIONS: &[&str] = &["1.0.0"];
+
+pub mod graph_data_model {
     //! This module contains the data types corresponding to the graph data files.
 
     use serde::de::Visitor;
@@ -109,6 +112,10 @@ pub struct OpenshiftSecondaryMetadataParserSettings {
 
     #[default(DEFAULT_ARCH.to_string())]
     default_arch: String,
+
+    /// This field is used to define errors which are not tolerated while processing the files.
+    /// See the `DeserializeDirectoryFilesError` enum for possible options.
+    disallowed_errors: std::collections::HashSet<DeserializeDirectoryFilesErrorDiscriminants>,
 }
 
 impl OpenshiftSecondaryMetadataParserSettings {
@@ -148,41 +155,103 @@ impl PluginSettings for OpenshiftSecondaryMetadataParserSettings {
     }
 }
 
-async fn deserialize_directory_files<T>(
+#[derive(Debug, Fail, strum_macros::EnumDiscriminants)]
+#[strum(serialize_all = "snake_case")]
+#[strum_discriminants(derive(Hash, Serialize, Deserialize), serde(rename_all = "snake_case"))]
+pub enum DeserializeDirectoryFilesError {
+    #[error("Error reading {0:?}: {1:#?}")]
+    File(PathBuf, std::io::Error),
+
+    #[error("{0:?}: has an invalid extension {1:?}")]
+    InvalidExtension(PathBuf, String),
+
+    #[error("{0:?}: is missing an extension")]
+    MissingExtension(PathBuf),
+
+    #[error("Failed to deserialize {0:?}: {1:#?}")]
+    Deserialize(PathBuf, serde_yaml::Error),
+}
+
+pub async fn deserialize_directory_files<T>(
     path: &PathBuf,
     extension_re: regex::Regex,
+    disallowed_errors: &HashSet<DeserializeDirectoryFilesErrorDiscriminants>,
 ) -> Fallible<Vec<T>>
 where
     T: DeserializeOwned,
 {
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use tokio::stream::Stream;
     use tokio::stream::StreamExt;
+
+    // Even though we don't use concurrent threads, the usage of async forces us
+    // to guarantee that the error container is thread-safe
+    let error: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
+    macro_rules! commit_error {
+        ($error_var:ident, $e:expr) => {
+            let e = $e;
+            let variant: DeserializeDirectoryFilesErrorDiscriminants = (&e).into();
+            if disallowed_errors.contains(&variant) {
+                match $error_var.lock() {
+                    Ok(mut guard) => {
+                        let inner = if let Some(previous_error) = std::mem::replace(&mut *guard, None) {
+                            previous_error.context(e)
+                        } else {
+                            Error::from(e)
+                        };
+                        *guard = Some(inner);
+
+                    },
+                    Err(e) => {
+                        error!("the thread holding the error lock has paniced: {}", e);
+                    }
+                };
+            }
+        };
+    }
 
     let mut paths = tokio::fs::read_dir(&path)
         .await
         .context(format!("Reading directory {:?}", &path))?
         .filter_map(|tried_direntry| match tried_direntry {
-            Ok(direntry) => Some(direntry),
-            Err(e) => {
-                warn!("{}", e);
-                None
-            }
-        })
-        .filter_map(|direntry| {
-            let path = direntry.path();
-            if let Some(extension) = &path.extension() {
-                if extension_re.is_match(extension.to_str().unwrap_or_default()) {
-                    Some(path)
+            Ok(direntry) => {
+                let path = direntry.path();
+                if let Some(extension) = &path.extension() {
+                    let extension_str = extension.to_str().unwrap_or_default();
+                    if extension_re.is_match(extension_str) {
+                        Some(path)
+                    } else {
+                        commit_error!(
+                            error,
+                            DeserializeDirectoryFilesError::InvalidExtension(
+                                path.clone(),
+                                extension_str.to_string(),
+                            )
+                        );
+
+                        None
+                    }
                 } else {
+                    debug!("{:?} does not have an extension", &path);
+                    commit_error!(
+                        error,
+                        DeserializeDirectoryFilesError::MissingExtension(path)
+                    );
                     None
                 }
-            } else {
-                debug!("{:?} does not have an extension", &path);
+            }
+            Err(e) => {
+                warn!("{}", e);
+                commit_error!(
+                    error,
+                    DeserializeDirectoryFilesError::File(path.to_path_buf(), e)
+                );
                 None
             }
         });
 
-    let mut t_vec: Vec<T> = Vec::with_capacity(match paths.size_hint() {
+    let mut t_vec = Vec::with_capacity(match paths.size_hint() {
         (_, Some(upper)) => upper,
         (lower, None) => lower,
     });
@@ -193,16 +262,28 @@ where
                 Ok(value) => t_vec.push(value),
                 Err(e) => {
                     warn!("Failed to deserialize file at {:?}: {}", &path, e);
+                    commit_error!(error, DeserializeDirectoryFilesError::Deserialize(path, e));
                 }
             },
             Err(e) => {
                 warn!("Couldn't read file {:?}: {}", &path, e);
+                commit_error!(error, DeserializeDirectoryFilesError::File(path, e));
             }
         }
     }
 
+    if let Some(error) = Arc::try_unwrap(error)
+        .map_err(|_| Error::msg("could not unwrap the error container"))?
+        .into_inner()?
+    {
+        bail!(error);
+    }
+
     Ok(t_vec)
 }
+
+pub static BLOCKED_EDGES_DIR: &str = "blocked-edges";
+pub static CHANNELS_DIR: &str = "channels";
 
 impl OpenshiftSecondaryMetadataParserPlugin {
     pub(crate) const PLUGIN_NAME: &'static str = "openshift-secondary-metadata-parse";
@@ -212,6 +293,24 @@ impl OpenshiftSecondaryMetadataParserPlugin {
             PathBuf::from(data_dir)
         } else {
             self.settings.data_directory.clone()
+        }
+    }
+
+    async fn process_version(&self, data_dir: &PathBuf) -> Fallible<String> {
+        let path = data_dir.join("version");
+        let version = tokio::fs::read(&path)
+            .await
+            .context(format!("Reading {:?}", &path))?;
+        let string_version = String::from_utf8_lossy(&version);
+
+        if SUPPORTED_VERSIONS.contains(&string_version.trim()) {
+            Ok(string_version.into_owned())
+        } else {
+            Err(format_err!(
+                "unrecognized graph-data version {}; supported versions: {:?}",
+                string_version,
+                SUPPORTED_VERSIONS
+            ))
         }
     }
 
@@ -272,14 +371,18 @@ impl OpenshiftSecondaryMetadataParserPlugin {
         graph: &mut cincinnati::Graph,
         data_dir: &PathBuf,
     ) -> Fallible<()> {
-        let blocked_edges_dir = data_dir.join("blocked-edges");
-        let blocked_edges: Vec<graph_data_model::BlockedEdge> =
-            deserialize_directory_files(&blocked_edges_dir, regex::Regex::new("ya+ml")?)
-                .await
-                .context(format!(
-                    "Reading blocked edges from {:?}",
-                    blocked_edges_dir
-                ))?;
+        let blocked_edges_dir = data_dir.join(BLOCKED_EDGES_DIR);
+        let blocked_edges: Vec<graph_data_model::BlockedEdge> = deserialize_directory_files(
+            &blocked_edges_dir,
+            regex::Regex::new("ya+ml")?,
+            &self.settings.disallowed_errors,
+        )
+        .await
+        .context(format!(
+            "Reading blocked edges from {:?}",
+            blocked_edges_dir
+        ))?;
+
         debug!(
             "Found {} valid blocked edges declarations.",
             blocked_edges.len()
@@ -377,11 +480,14 @@ impl OpenshiftSecondaryMetadataParserPlugin {
         graph: &mut cincinnati::Graph,
         data_dir: &PathBuf,
     ) -> Fallible<()> {
-        let channels_dir = data_dir.join("channels");
-        let channels: Vec<graph_data_model::Channel> =
-            deserialize_directory_files(&channels_dir, regex::Regex::new("ya+ml")?)
-                .await
-                .context(format!("Reading channels from {:?}", channels_dir))?;
+        let channels_dir = data_dir.join(CHANNELS_DIR);
+        let channels: Vec<graph_data_model::Channel> = deserialize_directory_files(
+            &channels_dir,
+            regex::Regex::new("ya+ml")?,
+            &self.settings.disallowed_errors,
+        )
+        .await
+        .context(format!("Reading channels from {:?}", channels_dir))?;
         debug!("Found {} valid channel declarations.", channels.len());
 
         let channels_key = format!("{}.release.channels", self.settings.key_prefix);
@@ -476,6 +582,7 @@ impl InternalPlugin for OpenshiftSecondaryMetadataParserPlugin {
     async fn run_internal(self: &Self, mut io: InternalIO) -> Fallible<InternalIO> {
         let data_dir = self.get_data_directory(&io);
 
+        self.process_version(&data_dir).await?;
         self.process_raw_metadata(&mut io.graph, &data_dir).await?;
         self.process_blocked_edges(&mut io.graph, &data_dir).await?;
         self.process_channels(&mut io.graph, &data_dir).await?;
@@ -507,8 +614,8 @@ mod tests {
 
     #[test_case("20200220.104838")]
     #[test_case("20200319.204124")]
-    fn compare_quay_result_fixture(fixture: &str) -> Fallible<()> {
-        let mut runtime = commons::testing::init_runtime()?;
+    fn compare_quay_result_fixture(fixture: &str) {
+        let mut runtime = commons::testing::init_runtime().unwrap();
 
         let fixture_directory = TEST_FIXTURE_DIR.join(fixture);
 
@@ -522,9 +629,9 @@ mod tests {
         };
 
         // Get the fixture data
-        let graph_raw = read_file_to_graph("graph-gb-raw.json")?;
+        let graph_raw = read_file_to_graph("graph-gb-raw.json").unwrap();
         let graph_with_quay_metadata: cincinnati::Graph =
-            read_file_to_graph("graph-gb-with-quay-metadata.json")?;
+            read_file_to_graph("graph-gb-with-quay-metadata.json").unwrap();
 
         // Configure the plugin
         let plugin = Box::new(OpenshiftSecondaryMetadataParserPlugin::new(
@@ -536,8 +643,10 @@ mod tests {
                 &fixture_directory.join("cincinnati-graph-data"),
                 cincinnati::plugins::internal::edge_add_remove::DEFAULT_KEY_FILTER,
             ))
-            .context("Parsing config string to settings")?,
+            .context("Parsing config string to settings")
+            .unwrap(),
         ));
+
         let edge_add_remove_plugin = Box::new(
             cincinnati::plugins::internal::edge_add_remove::EdgeAddRemovePlugin {
                 remove_consumed_metadata: false,
@@ -553,14 +662,16 @@ mod tests {
                     graph: graph_raw,
                     parameters: Default::default(),
                 }))
-                .context("Running plugin")?;
+                .context("Running plugin")
+                .unwrap();
 
             // Run through the EdgeAddRemovePlugin to compare it with the control data
             runtime
                 .block_on(edge_add_remove_plugin.run_internal(io))
                 .context(
                     "Running plugin result with quay metadata through the EdgeEAddRemovePlugin",
-                )?
+                )
+                .unwrap()
                 .graph
         };
 
@@ -574,21 +685,59 @@ mod tests {
                 }))
                 .context(
                     "Running fixture graph with quay metadata through the EdgeEAddRemovePlugin",
-                )?
+                )
+                .unwrap()
                 .graph
         };
 
         if let Err(e) = compare_graphs_verbose(
             graph_expected,
             graph_result,
-            &[
-                "io.openshift.upgrades.graph.previous.remove",
-                "io.openshift.upgrades.graph.previous.remove_regex",
-            ],
+            cincinnati::testing::CompareGraphsVerboseSettings {
+                unwanted_metadata_keys: &[
+                    "io.openshift.upgrades.graph.previous.remove_regex",
+                    "io.openshift.upgrades.graph.previous.remove",
+                ],
+
+                ..Default::default()
+            },
         ) {
             panic!("{}", e);
         }
+    }
 
-        Ok(())
+    #[test_case("file")]
+    #[test_case("deserialize")]
+    #[test_case("missing_extension")]
+    #[test_case("invalid_extension")]
+    fn disallowed_errors_is_effective(disallowed_error: &str) {
+        let mut runtime = commons::testing::init_runtime().unwrap();
+
+        let fixture_directory = TEST_FIXTURE_DIR.join("invalid0");
+
+        // Configure the plugin
+        let plugin = Box::new(OpenshiftSecondaryMetadataParserPlugin::new(
+            toml::from_str(&format!(
+                r#"
+                    data_directory = {:?}
+                    key_prefix = "{}"
+                    disallowed_errors = [ "{}" ]
+                "#,
+                &fixture_directory.join("cincinnati-graph-data"),
+                cincinnati::plugins::internal::edge_add_remove::DEFAULT_KEY_FILTER,
+                disallowed_error
+            ))
+            .context("Parsing config string to settings")
+            .unwrap(),
+        ));
+
+        // Run the plugin
+        runtime
+            .block_on(plugin.run_internal(InternalIO {
+                graph: Default::default(),
+                parameters: Default::default(),
+            }))
+            .context("Running plugin")
+            .unwrap_err();
     }
 }

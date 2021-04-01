@@ -15,6 +15,7 @@
 use crate as cincinnati;
 
 use self::cincinnati::plugins::internal::graph_builder::release::Metadata;
+use self::cincinnati::plugins::internal::graph_builder::release::MetadataKind;
 use self::cincinnati::plugins::prelude_plugin_impl::*;
 
 use flate2::read::GzDecoder;
@@ -22,6 +23,7 @@ use futures::lock::Mutex as FuturesMutex;
 use futures::prelude::*;
 use futures::TryStreamExt;
 use log::{debug, error, trace, warn};
+use semver::Version;
 use serde::Deserialize;
 use serde_json;
 use std::fs::File;
@@ -60,7 +62,7 @@ pub mod cache {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct Registry {
     pub(crate) scheme: String,
     pub(crate) insecure: bool,
@@ -198,6 +200,44 @@ pub fn read_credentials(
     })
 }
 
+pub async fn new_registry_client(
+    registry: &Registry,
+    repo: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<dkregistry::v2::Client, Error> {
+    let client = {
+        let client_builder = dkregistry::v2::Client::configure()
+            .registry(&registry.host_port_string())
+            .insecure_registry(registry.insecure);
+        let scope = format!("repository:{}:pull", &repo);
+
+        if username.is_some() && password.is_some() {
+            client_builder
+                .username(username.map(ToString::to_string))
+                .password(password.map(ToString::to_string))
+                .build()?
+                .authenticate(&[&scope])
+                .await?
+        } else {
+            let client = client_builder.build()?;
+
+            if client
+                .is_v2_supported_and_authorized()
+                .await
+                .map(|(_, authorized)| authorized)?
+            {
+                client
+            } else {
+                debug!("registry not authorized, attempting anonymous authorization");
+                client.authenticate(&[&scope]).await?
+            }
+        }
+    };
+
+    Ok(client)
+}
+
 /// Fetches a vector of all release metadata from the given repository, hosted on the given
 /// registry.
 pub async fn fetch_releases(
@@ -209,26 +249,7 @@ pub async fn fetch_releases(
     manifestref_key: &str,
     concurrency: usize,
 ) -> Result<Vec<cincinnati::plugins::internal::graph_builder::release::Release>, Error> {
-    let registry_client = {
-        let authenticate = username.is_some() && password.is_some();
-
-        let client_builder = dkregistry::v2::Client::configure()
-            .registry(&registry.host_port_string())
-            .insecure_registry(registry.insecure);
-
-        if authenticate {
-            client_builder
-                .username(username.map(ToString::to_string))
-                .password(password.map(ToString::to_string))
-                .build()
-                .map_err(|e| format_err!("{}", e))?
-                .authenticate(&[&format!("repository:{}:pull", &repo)])
-                .await
-        } else {
-            client_builder.build()
-        }
-        .map_err(|e| format_err!("{}", e))?
-    };
+    let registry_client = new_registry_client(registry, repo, username, password).await?;
 
     let registry_client_get_tags = registry_client.clone();
     let tags = Box::pin(get_tags(repo, &registry_client_get_tags).await);
@@ -358,6 +379,15 @@ async fn lookup_or_fetch(
             cached_metadata.clone()
         }
         None => {
+            let placeholder = Option::from(Metadata {
+                kind: MetadataKind::V0,
+                version: Version::new(0, 0, 0),
+                previous: vec![],
+                next: vec![],
+                metadata: Default::default(),
+            });
+            cache.write().await.insert(manifestref.clone(), placeholder);
+
             let metadata = find_first_release_metadata(
                 layer_digests,
                 registry_client,
@@ -585,7 +615,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-#[cfg(feature = "test-net")]
-mod network_tests;

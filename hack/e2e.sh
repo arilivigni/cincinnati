@@ -6,9 +6,9 @@
 # * Ensures generated graph is valid
 
 # Prerequirements:
-#   * pull secret (with registry.svc.ci.openshift.org) part in `/tmp/cluster/pull-secret`
+#   * pull secret (with registry.ci.openshift.org) part in `/tmp/cluster/pull-secret`
 #   * CINCINNATI_IMAGE (optional) - image with graph-builder and policy-engine
-#   * env var IMAGE_FORMAT (e.g `registry.svc.ci.openshift.org/ci-op-ish8m5dt/stable:${component}`)
+#   * env var IMAGE_FORMAT (e.g `registry.ci.openshift.org/ci-op-ish8m5dt/stable:${component}`)
 
 # Use CI image format by default unless CINCINNATI_IMAGE is set
 if [[ ! -z "${CINCINNATI_IMAGE}" ]]; then
@@ -23,9 +23,13 @@ echo "IMAGE=${IMAGE}"
 echo "IMAGE_TAG=${IMAGE_TAG}"
 
 # Use defined PULL_SECRET or fall back to CI location
-PULL_SECRET=${PULL_SECRET:-/tmp/cluster/pull-secret}
+PULL_SECRET=${PULL_SECRET:-/var/run/secrets/ci.openshift.io/cluster-profile/pull-secret}
 
 set -euo pipefail
+# Copy KUBECONFIG so that it can be mutated
+cp -Lrvf $KUBECONFIG /tmp/kubeconfig
+export KUBECONFIG=/tmp/kubeconfig
+
 # Create a new project
 oc new-project cincinnati-e2e
 oc project cincinnati-e2e
@@ -46,7 +50,8 @@ oc secrets link default ci-pull-secret --for=pull
 
 # Reconfigure monitoring operator to support user workloads
 # https://docs.openshift.com/container-platform/4.3/monitoring/monitoring-your-own-services.html
-oc -n openshift-monitoring create configmap cluster-monitoring-config --from-literal='config.yaml={"techPreviewUserWorkload": {"enabled": true}}'
+oc -n openshift-monitoring create configmap cluster-monitoring-config --from-literal='config.yaml={"techPreviewUserWorkload": {"enabled": true}}' -o yaml --dry-run=client > /tmp/cluster-monitoring-config.yaml
+oc apply -f /tmp/cluster-monitoring-config.yaml
 
 # Import observability template
 # ServiceMonitors are imported before app deployment to give Prometheus time to catch up with
@@ -70,7 +75,8 @@ oc new-app -f dist/openshift/cincinnati.yaml \
   -p GB_PLUGIN_SETTINGS="$(cat <<-EOF
       [[plugin_settings]]
       name = "release-scrape-dockerv2"
-      repository = "openshift-release-dev/ocp-release"
+      registry = "${E2E_SCRAPE_REGISTRY:-quay.io}"
+      repository = "${E2E_SCRAPE_REPOSITORY:-openshift-release-dev/ocp-release}"
       fetch_concurrency = 128
 
       [[plugin_settings]]

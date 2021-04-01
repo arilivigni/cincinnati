@@ -1,27 +1,25 @@
-FROM centos:7
+FROM registry.centos.org/centos/centos:7
 
 # base: EPEL repo for extra tools
 RUN yum -y install epel-release
 
 # build: system utilities and libraries
-RUN yum -y groupinstall 'Development Tools'
-RUN yum -y install openssl-devel protobuf-compiler
+RUN yum update -y && \
+    yum -y install epel-release && \
+    yum -y groupinstall 'Development Tools' && \
+    yum -y install openssl-devel protobuf-compiler jq skopeo buildah && \
+    yum -y install yamllint && \
+    yum -y install cmake elfutils-libelf-devel libcurl-devel binutils-devel elfutils-devel && \
+    yum clean all
 
 ENV HOME="/root"
 ENV PATH="${HOME}/.cargo/bin:${PATH}"
 
-# build: Rust stable toolchain + 2 previous versions
-RUN curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain 1.42.0 -y && \
-  rustup install 1.39.0 && \
-  rustup install 1.40.0 && \
-  rustup install 1.41.0 && \
-  rustup default 1.42.0
-
-# test: linters
-RUN yum -y install yamllint
+# build: Rust stable toolchain
+RUN curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain 1.46.0 -y && \
+  rustup install 1.43.1
 
 # test: code coverage
-RUN yum -y install cmake elfutils-libelf-devel libcurl-devel binutils-devel elfutils-devel
 RUN \
   mkdir $HOME/kcov && \
   pushd $HOME/kcov && \

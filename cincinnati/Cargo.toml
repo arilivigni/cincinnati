@@ -5,46 +5,50 @@ authors = ["Alex Crawford <crawford@redhat.com>"]
 edition = "2018"
 
 [dependencies]
-actix-web = "^2.0"
+actix-web = "^3.3.2"
 commons = { path = "../commons" }
-custom_debug_derive = "^0.1.7"
-daggy = { version = "^0.6.0", features = [ "serde-1" ] }
-env_logger = "^0.6.0"
+custom_debug_derive = "^0.5"
+daggy = { version = "^0.7.0", features = [ "serde-1" ] }
+env_logger = "^0.8"
 futures = "0.3"
-futures-locks = "0.5.0"
+futures-locks = "0.6.0"
 lazy_static = "^1.2.0"
 log = "^0.4.3"
 prometheus = "0.9"
-protobuf = "2.0"
+protobuf = "2.20.0"
 quay = { path = "../quay" }
 regex = "^1.1.0"
 reqwest = { version = "^0.10", features = ["gzip"] }
 serde = "1.0.70"
 serde_derive = "1.0.70"
 serde_json = "^1.0.22"
-smart-default = "^0.5.2"
-tokio = { version = "0.2.11", features = [ "time", "fs", "stream" ] }
-toml = "^0.4.10"
-url = "^1.7.2"
-semver = { version = "^0.9.0", features = [ "serde" ] }
+smart-default = "^0.6"
+tokio = { version = "0.2.11", features = [ "time", "fs", "stream", "rt-threaded", "blocking", "macros" ] }
+toml = "^0.5"
+url = "^2.2"
+semver = { version = "^0.11", features = [ "serde" ] }
 async-trait = "^0.1"
 tempfile = "^3.1.0"
 flate2 = "^1.0.1"
 tar = "^0.4.16"
-dkregistry = "^0.4.0"
-itertools = "^0.8.2"
+dkregistry = { git = "https://github.com/camallo/dkregistry-rs.git", rev = "d4b39f238989fefa722f21d248f65e667ee55341" }
+itertools = "^0.10"
 serde_yaml = "^0.8.11"
-prettydiff = { version = "0.3.1", optional = true }
-opentelemetry = "0.4.0"
+prettydiff = { version = "0.4", optional = true }
+opentelemetry = "0.4"
+strum = "^0.20"
+strum_macros = "^0.20"
+walkdir = "2.3.1"
+bytes = "^0.5.6"
+pgp = "^0.7.1"
 
 [dev-dependencies]
-mockito = "^0.20.0"
+mockito = "^0.28"
 serde_json = "1.0.22"
 twoway = "^0.2"
-walkdir = "2.3.1"
 pretty_assertions = "0.6.1"
 test-case = "1.0.0"
-prettydiff = "0.3.1"
+prettydiff = "0.4"
 
 [build-dependencies]
 protoc-rust = "2.8"
