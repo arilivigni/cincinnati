@@ -8,7 +8,7 @@ set -exv
 DOCKERFILE_BUILD="$DOCKERFILE_CONTEXT_DIR/Dockerfile.build"
 DOCKERFILE_DEPLOY="$DOCKERFILE_CONTEXT_DIR/Dockerfile.deploy"
 
-# build cincinnati builder image
+# build cincinnati builder image to use as base for the deployment image
 buildah bud --tls-verify=$SSL_VERIFY \
 --layers \
 -f $DOCKERFILE_BUILD/Dockerfile \
