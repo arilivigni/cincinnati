@@ -21,7 +21,7 @@ use commons::metrics::HasRegistry;
 use commons::tracing::get_tracer;
 use commons::{Fallible, GraphError};
 use lazy_static;
-use opentelemetry::api::Tracer;
+use opentelemetry::trace::{mark_span_as_active, Tracer};
 pub use parking_lot::RwLock;
 use prometheus::{self, histogram_opts, labels, opts, Counter, Gauge, Histogram, IntGauge};
 use serde_json;
@@ -71,7 +71,7 @@ lazy_static! {
         "build_info",
         "Build information",
         labels!{
-            "git_commit" => match built_info::GIT_VERSION {
+            "git_commit" => match built_info::GIT_COMMIT_HASH {
                 Some(commit) => commit,
                 None => "unknown"
             },
@@ -99,12 +99,13 @@ pub async fn index(
     req: HttpRequest,
     app_data: actix_web::web::Data<State>,
 ) -> Result<HttpResponse, GraphError> {
-    let _ = get_tracer().start("index", None);
+    let span = get_tracer().start("index");
+    let _active_span = mark_span_as_active(span);
 
     V1_GRAPH_INCOMING_REQS.inc();
 
     // Check that the client can accept JSON media type.
-    commons::ensure_content_type(req.headers(), CONTENT_TYPE)?;
+    commons::validate_content_type(req.headers(), CONTENT_TYPE)?;
 
     // Check for required client parameters.
     let mandatory_params = &app_data.mandatory_params;

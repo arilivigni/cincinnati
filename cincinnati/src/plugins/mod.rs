@@ -20,7 +20,10 @@ use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt::Debug;
 
-use opentelemetry::api::{trace::futures::Instrument, Tracer};
+use opentelemetry::{
+    trace::{mark_span_as_active, FutureExt, Tracer},
+    Context as ot_context,
+};
 
 pub mod prelude {
     use crate as cincinnati;
@@ -384,14 +387,17 @@ where
 {
     let mut io = initial_io;
 
-    let _ = get_tracer().start("plugins", None);
+    let span = get_tracer().start("plugins");
+    let _active_span = mark_span_as_active(span);
 
     for next_plugin in plugins {
         let plugin_name = next_plugin.get_name();
         log::trace!("Running next plugin '{}'", plugin_name);
 
-        let plugin_span = get_tracer().start(plugin_name, None);
-        io = next_plugin.run(io).instrument(plugin_span).await?;
+        let plugin_span = get_tracer().start(plugin_name);
+        let _active_plugin_span = mark_span_as_active(plugin_span);
+        let cx = ot_context::current();
+        io = next_plugin.run(io).with_context(cx).await?;
     }
 
     io.try_into()
@@ -417,7 +423,7 @@ where
     T: Sync + Send,
     T: 'static,
 {
-    let mut runtime = tokio::runtime::Runtime::new()?;
+    let runtime = tokio::runtime::Runtime::new()?;
 
     let timeout = match timeout {
         None => return runtime.block_on(process(plugins, initial_io)),
@@ -547,7 +553,7 @@ mod tests {
 
     #[test]
     fn process_plugins_roundtrip_external_internal() -> Fallible<()> {
-        let mut runtime = commons::testing::init_runtime()?;
+        let runtime = commons::testing::init_runtime()?;
 
         lazy_static! {
             static ref PLUGINS: Vec<BoxedPlugin> = new_plugins!(
@@ -594,7 +600,7 @@ mod tests {
 
     #[test]
     fn process_plugins_loop() -> Fallible<()> {
-        let mut runtime = commons::testing::init_runtime()?;
+        let runtime = commons::testing::init_runtime()?;
 
         lazy_static! {
             static ref PLUGINS: Vec<BoxedPlugin> = new_plugins!(

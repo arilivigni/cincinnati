@@ -11,8 +11,12 @@ use self::cincinnati::CONTENT_TYPE;
 
 use commons::prelude_errors::*;
 use commons::tracing::{get_tracer, set_context};
-use opentelemetry::api::{Span, Tracer};
+use opentelemetry::{
+    trace::{mark_span_as_active, Tracer},
+    Context as ot_context,
+};
 
+use commons::prelude_errors::Context;
 use commons::GraphError;
 use prometheus::Counter;
 use reqwest;
@@ -117,9 +121,10 @@ impl CincinnatiGraphFetchPlugin {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static(CONTENT_TYPE));
         {
-            let span = get_tracer().get_active_span();
-            set_context(span.get_context(), &mut headers)
-                .context("failed to set the tracing context")?;
+            let span = get_tracer().start("");
+            let _active_span = mark_span_as_active(span);
+            let cx = ot_context::current();
+            set_context(cx, &mut headers).context("failed to set the tracing context")?;
         }
 
         trace!("getting graph from upstream at {}", self.upstream);
@@ -174,6 +179,7 @@ mod tests {
     use cincinnati::testing::generate_custom_graph;
     use commons::metrics::{self, RegistryWrapper};
     use commons::testing::{self, init_runtime};
+    use memchr::memmem;
     use prometheus::Registry;
 
     macro_rules! fetch_upstream_success_test {
@@ -185,7 +191,7 @@ mod tests {
         ) => {
             #[test]
             fn $name() -> Fallible<()> {
-                let mut runtime = init_runtime()?;
+                let runtime = init_runtime()?;
 
                 // run mock graph-builder
                 let _m = mockito::mock("GET", "/")
@@ -253,7 +259,7 @@ mod tests {
         ) => {
             #[test]
             fn $name() -> Fallible<()> {
-                let mut runtime = init_runtime()?;
+                let runtime = init_runtime()?;
                 // run mock graph-builder
                 let _m = mockito::mock("GET", "/")
                     .with_status($mock_status)
@@ -317,7 +323,7 @@ mod tests {
 
     #[test]
     fn register_metrics() -> Fallible<()> {
-        let mut rt = testing::init_runtime()?;
+        let rt = testing::init_runtime()?;
 
         let metrics_prefix = "test_service".to_string();
         let registry: &'static Registry = Box::leak(Box::new(metrics::new_registry(Some(
@@ -339,15 +345,17 @@ mod tests {
             if let actix_web::body::Body::Bytes(bytes) = body {
                 assert!(!bytes.is_empty());
                 println!("{:?}", std::str::from_utf8(bytes.as_ref()));
-                assert!(twoway::find_bytes(
+                assert!(memmem::find_iter(
                     bytes.as_ref(),
-                    format!("{}_http_upstream_errors_total 0\n", &metrics_prefix).as_bytes()
+                    format!("{}_http_upstream_errors_total 0\n", &metrics_prefix).as_bytes(),
                 )
+                .next()
                 .is_some());
-                assert!(twoway::find_bytes(
+                assert!(memmem::find_iter(
                     bytes.as_ref(),
-                    format!("{}_http_upstream_requests_total 0\n", &metrics_prefix).as_bytes()
+                    format!("{}_http_upstream_requests_total 0\n", &metrics_prefix).as_bytes(),
                 )
+                .next()
                 .is_some());
             } else {
                 bail!("expected Body")
